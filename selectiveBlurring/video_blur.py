@@ -8,9 +8,6 @@ from PIL import Image
 import argparse
 from helpers import similarity_from_descriptors  # Import modified function
 from extractor import ViTExtractor
-import time
-
-import matplotlib.pyplot as plt
 
 def process_video_frames(video_frames, descriptors_folder, selected_descriptors, model_type="dino_vits8", stride=4, device="cuda"):
     """
@@ -27,6 +24,11 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     device = torch.device(device)
     extractor = ViTExtractor(model_type, stride=stride, device=device)
 
+    # Generate an instance of the GaussianBlur class
+    blur_kernel_size = 49  # Kernel size for blurring
+    blur_sigma = 6.0       # Sigma value for blurring
+    gauss_blur = GaussianBlur(blur_kernel_size, sigma=blur_sigma)
+
     # Load descriptors
     descriptor_files = [f for f in os.listdir(descriptors_folder) if f.endswith(".pt")]
     descriptors_batch = [
@@ -37,37 +39,41 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
 
     # Process each frame
     processed_frames = []
+    batch_size = 8
     with torch.no_grad():
-        for frame_path in tqdm(video_frames, desc="Processing frames"):
-            # Load and prepare the frame
-            orig_image = read_image(frame_path).to(device)
-            orig_image_float = orig_image.float()
+        for i in tqdm(range(0, len(video_frames), batch_size), desc="Processing frames"):
+            batch_frames = video_frames[i:i + batch_size]
+            
+            # Load and prepare the frames
+            orig_images = [read_image(frame_path).to(device) for frame_path in batch_frames]
+            orig_images_float = [img.float() for img in orig_images]
             
             # Compute similarity map using the batched descriptors
             similarity_maps = similarity_from_descriptors(
-                descriptors_batch, [frame_path], extractor, device=device
+                descriptors_batch, batch_frames, extractor, device=device
             )
-            batched_visual_features = (similarity_maps[0] * 255.0).clamp(80, 255).squeeze()
 
-            # Generate saliency map
-            saliency_map = (batched_visual_features - batched_visual_features.min()) / \
-                           (batched_visual_features.max() - batched_visual_features.min())
-            
-            # Generate a blurred version of the image
-            blur_kernel_size = 49  # Kernel size for blurring
-            blur_sigma = 6.0       # Sigma value for blurring
-            blurred_image = GaussianBlur(blur_kernel_size, sigma=blur_sigma)(orig_image_float)
+            for j, frame_path in enumerate(batch_frames):
+                batched_visual_features = (similarity_maps[j] * 255.0).clamp(80, 255).squeeze()
 
-            # Adjust saliency map for blending
-            saliency_map_adjusted = torch.where(saliency_map > 0.1, torch.ones_like(saliency_map), torch.zeros_like(saliency_map))
-            saliency_map_adjusted = saliency_map_adjusted.to(device)
+                # Generate saliency map
+                saliency_map = (batched_visual_features - batched_visual_features.min()) / \
+                               (batched_visual_features.max() - batched_visual_features.min())
+                
+                # Generate a blurred version of the image
+                blurred_image = gauss_blur(orig_images_float[j])
 
-            # Blend original and blurred images using adjusted saliency map
-            noisy_image = orig_image_float * (1 - saliency_map_adjusted.unsqueeze(0)) + blurred_image * saliency_map_adjusted.unsqueeze(0)
+                # Adjust saliency map for blending
+                saliency_map_adjusted = torch.where(saliency_map > 0.1, 0.75 + saliency_map, torch.zeros_like(saliency_map))
+                saliency_map_adjusted = torch.clamp(saliency_map_adjusted, 0.0, 1.0)
+                saliency_map_adjusted = saliency_map_adjusted.to(device)
 
-            # Convert image back to byte format
-            noisy_image = noisy_image.clamp(0, 255).byte()
-            processed_frames.append(noisy_image.permute(1, 2, 0).cpu().byte())
+                # Blend original and blurred images using adjusted saliency map
+                noisy_image = orig_images_float[j] * (1 - saliency_map_adjusted.unsqueeze(0)) + blurred_image * saliency_map_adjusted.unsqueeze(0)
+
+                # Convert image back to byte format
+                noisy_image = noisy_image.clamp(0, 255).byte()
+                processed_frames.append(noisy_image.permute(1, 2, 0).cpu().byte())
     
     return processed_frames
 
@@ -80,7 +86,7 @@ def process_video(args):
 
     # Get list of video frames from the specified directory
     video_frames = [os.path.join(args.frames_dir, f) for f in os.listdir(args.frames_dir) if f.endswith(('.jpg', '.png'))]
-    video_frames.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))  # Sort frames numerically
+    video_frames.sort(key=lambda x: int(''.join(filter(str.isdigit, os.path.splitext(os.path.basename(x))[0]))))  # Sort frames numerically
 
     # video_frames = video_frames[:10]  # Process only the first 10 frames for demonstration
 
@@ -114,7 +120,7 @@ def process_video(args):
         processed_gif_path,
         save_all=True,
         append_images=processed_frames_pil[1:],
-        duration=200,  # Duration between frames in milliseconds
+        duration=100,  # Duration between frames in milliseconds
         loop=0
     )
     print(f"Processed frames saved to: {processed_gif_path}")

@@ -188,6 +188,46 @@ class ViTExtractor:
         )
         prep_img = prep(pil_image)[None, ...]
         return prep_img, pil_image
+    
+    def preprocess_batch(
+        self, 
+        image_paths: List[Union[str, Path]], 
+        load_size: Union[int, Tuple[int, int]] = None
+    ) -> Tuple[torch.Tensor, Tuple[int, int]]:
+        """
+        Preprocesses a batch of images before extraction.
+        
+        :param image_paths: list of paths to images to be extracted.
+        :param load_size: optional. Size to resize images before further processing.
+        
+        :return: a tuple containing:
+                    (1) the preprocessed images as a tensor of shape BxCxHxW.
+                    (2) the original (height, width) dimensions of the first image.
+        """
+        images = []
+        original_size = None
+        
+        for image_path in image_paths:
+            pil_image = Image.open(image_path).convert("RGB")
+            if original_size is None:
+                original_size = pil_image.size[::-1]  # Store original (height, width) of the first image
+            
+            if load_size is not None:
+                pil_image = transforms.Resize(
+                    load_size, interpolation=transforms.InterpolationMode.LANCZOS
+                )(pil_image)
+            
+            # Convert to tensor and normalize
+            prep = transforms.Compose(
+                [transforms.ToTensor(), transforms.Normalize(mean=self.mean, std=self.std)]
+            )
+            prep_img = prep(pil_image)
+            images.append(prep_img)
+        
+        # Stack all images to form a batch
+        images_tensor = torch.stack(images)  # Shape: (batch_size, C, H, W)
+        
+        return images_tensor, original_size
 
     def _get_hook(self, facet: str):
         """

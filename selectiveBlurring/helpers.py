@@ -154,9 +154,77 @@ def batch_chunk_cosine_sim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
     return similarity  # returns Bx1x1x(t_x)x(t_y)
 
 
+# def similarity_from_descriptors(
+#     descriptors_batch,  # Shape: (num_descriptors, descriptor_dim)
+#     images: list,
+#     extractor: ViTExtractor,
+#     load_size: int = 224,
+#     layer: int = 11,
+#     facet: str = "key",
+#     bin: bool = False,
+#     device="cuda",
+# ):
+#     """
+#     Computes similarity between a batch of descriptors and descriptors extracted from multiple images.
+    
+#     :param descriptors_batch: Tensor of descriptors, shape (num_descriptors, descriptor_dim).
+#     :param images: List of paths to image files.
+#     :param load_size: Image load size for the model.
+#     :param layer: Layer from which to extract descriptors.
+#     :param facet: Facet type for descriptor extraction (e.g., "key", "query", etc.).
+#     :param bin: Boolean flag for binning descriptors.
+#     :param stride: Stride value for the model.
+#     :param model_type: Type of model to extract descriptors with (e.g., "dino_vits8").
+    
+#     :return: List of resized similarity maps for each image.
+#     """
+#     similarities = []
+#     img_size = Image.open(images[0]).size[::-1]  # Original image size for resizing
+    
+#     # Move descriptors batch to device for parallelized similarity calculation
+#     descriptors_batch = descriptors_batch.to(device)  # Shape: (num_descriptors, descriptor_dim)
+
+#     for image_path in images:
+#         # Preprocess image and extract descriptors
+#         image_batch, image_pil = extractor.preprocess(image_path, load_size)
+
+#         descs_image = extractor.extract_descriptors(
+#             image_batch.to(device), layer, facet, bin, include_cls=False
+#         )  # Shape: (1, num_patches, descriptor_dim)
+
+#         # Reshape descriptors for batch similarity calculation
+#         descs_image = descs_image.squeeze(0)  # Shape: (num_patches, descriptor_dim)
+        
+#         # Expand and reshape to align with batch_chunk_cosine_sim requirements
+#         # Add batch and singleton dimension to descriptors_batch and descs_image
+#         # Result shapes: (num_descriptors, 1, 1, descriptor_dim) and (1, 1, num_patches, descriptor_dim)
+#         descriptors_expanded = descriptors_batch[:, None, None, :] # Bx1x1xd'
+#         descs_image_expanded = descs_image[None, :, :] # 1xtxd'
+
+#         # Calculate cosine similarity using the batched chunk cosine sim function
+#         similarity = batch_chunk_cosine_sim(descriptors_expanded, descs_image_expanded)  # Shape: (num_descriptors, 1, 1, num_patches)
+
+#         # Aggregate similarity across descriptors 
+#         combined_similarity = similarity.max(dim=0).values  # Shape: (1, num_patches)
+
+#         similarity_image = combined_similarity.reshape(extractor.num_patches)
+
+#         # similarity_map_resized = transforms.Resize(img_size, antialias=False)(similarity_image.unsqueeze(0))
+#         similarity_map_resized = F.interpolate(
+#             similarity_image.unsqueeze(0).unsqueeze(0),
+#             size=img_size,
+#             mode='nearest',  # `nearest` is faster than `bilinear`
+#         ).squeeze()
+
+#         # Append the similarity map for this image
+#         similarities.append(similarity_map_resized.squeeze())
+    
+#     return similarities
+
+
 def similarity_from_descriptors(
     descriptors_batch,  # Shape: (num_descriptors, descriptor_dim)
-    images: list,
+    image_paths: list,
     extractor: ViTExtractor,
     load_size: int = 224,
     layer: int = 11,
@@ -165,58 +233,46 @@ def similarity_from_descriptors(
     device="cuda",
 ):
     """
-    Computes similarity between a batch of descriptors and descriptors extracted from multiple images.
+    Computes similarity between a batch of descriptors and descriptors extracted from multiple images, in parallel.
     
     :param descriptors_batch: Tensor of descriptors, shape (num_descriptors, descriptor_dim).
-    :param images: List of paths to image files.
+    :param image_paths: List of paths to image files.
     :param load_size: Image load size for the model.
     :param layer: Layer from which to extract descriptors.
-    :param facet: Facet type for descriptor extraction (e.g., "key", "query", etc.).
+    :param facet: Facet type for descriptor extraction (e.g., "key", "query").
     :param bin: Boolean flag for binning descriptors.
-    :param stride: Stride value for the model.
-    :param model_type: Type of model to extract descriptors with (e.g., "dino_vits8").
     
-    :return: List of resized similarity maps for each image.
+    :return: Tensor of resized similarity maps, shape (batch_size, height, width).
     """
-    similarities = []
-    img_size = Image.open(images[0]).size[::-1]  # Original image size for resizing
-    
-    # Move descriptors batch to device for parallelized similarity calculation
-    descriptors_batch = descriptors_batch.to(device)  # Shape: (num_descriptors, descriptor_dim)
+    # Preprocess images in a batch and get original sizes
+    image_batch, original_size = extractor.preprocess_batch(image_paths, load_size)  # Shape: (batch_size, C, H, W)
+    image_batch = image_batch.to(device)
+    descriptors_batch = descriptors_batch.to(device)  # Move descriptors to device
 
-    for image_path in images:
-        # Preprocess image and extract descriptors
-        image_batch, image_pil = extractor.preprocess(image_path, load_size)
+    # Extract descriptors for the entire batch
+    descs_images = extractor.extract_descriptors(
+        image_batch, layer, facet, bin, include_cls=False
+    )  # Shape: (batch_size, num_patches, descriptor_dim)
 
-        descs_image = extractor.extract_descriptors(
-            image_batch.to(device), layer, facet, bin, include_cls=False
-        )  # Shape: (1, num_patches, descriptor_dim)
+    # Expand dimensions for batch-wise cosine similarity calculation
+    descriptors_expanded = descriptors_batch[:, None, None, :]  # Shape: (num_descriptors, 1, 1, descriptor_dim)
+    descs_images_expanded = descs_images[:, None, :, :]  # Shape: (batch_size, 1, num_patches, descriptor_dim)
 
-        # Reshape descriptors for batch similarity calculation
-        descs_image = descs_image.squeeze(0)  # Shape: (num_patches, descriptor_dim)
-        
-        # Expand and reshape to align with batch_chunk_cosine_sim requirements
-        # Add batch and singleton dimension to descriptors_batch and descs_image
-        # Result shapes: (num_descriptors, 1, 1, descriptor_dim) and (1, 1, num_patches, descriptor_dim)
-        descriptors_expanded = descriptors_batch[:, None, None, :] # Bx1x1xd'
-        descs_image_expanded = descs_image[None, :, :] # 1xtxd'
+    # Compute cosine similarity for all descriptors and image patches in a single call
+    similarity = batch_chunk_cosine_sim(descriptors_expanded, descs_images_expanded)  # Shape: (batch_size, 1, num_descriptors, num_patches)
 
-        # Calculate cosine similarity using the batched chunk cosine sim function
-        similarity = batch_chunk_cosine_sim(descriptors_expanded, descs_image_expanded)  # Shape: (num_descriptors, 1, 1, num_patches)
+    # Aggregate similarity by taking the max similarity across descriptors for each image patch
+    combined_similarity = similarity.max(dim=1).values  # Shape: (batch_size, 1, num_patches)
 
-        # Aggregate similarity across descriptors 
-        combined_similarity = similarity.max(dim=0).values  # Shape: (1, num_patches)
+    # Reshape for batch-wise resizing
+    combined_similarity = combined_similarity.reshape(-1, 1, *extractor.num_patches)  # Shape: (batch_size, 1, num_patches_height, num_patches_width)
 
-        similarity_image = combined_similarity.reshape(extractor.num_patches)
+    # Resize all similarity maps in one operation to match each original image size
+    resized_similarity_maps = F.interpolate(
+        combined_similarity,  # Shape: (batch_size, 1, sqrt(num_patches), sqrt(num_patches))
+        size=original_size,  # Each image's original size
+        mode="bilinear",  # Bilinear interpolation for resizing
+    ).squeeze(1)  # Remove channel dimension, final shape: (batch_size, height, width)
 
-        # similarity_map_resized = transforms.Resize(img_size, antialias=False)(similarity_image.unsqueeze(0))
-        similarity_map_resized = F.interpolate(
-            similarity_image.unsqueeze(0).unsqueeze(0),
-            size=img_size,
-            mode='nearest',  # `nearest` is faster than `bilinear`
-        ).squeeze()
+    return resized_similarity_maps
 
-        # Append the similarity map for this image
-        similarities.append(similarity_map_resized.squeeze())
-    
-    return similarities
