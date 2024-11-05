@@ -25,9 +25,6 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     :return: List of processed frames with privacy-preserving blur applied.
     """
     device = torch.device(device)
-    if torch.backends.mps.is_available():
-        device = torch.device("mps")
-    print(stride)
     extractor = ViTExtractor(model_type, stride=stride, device=device)
 
     # Load descriptors
@@ -42,8 +39,6 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     processed_frames = []
     with torch.no_grad():
         for frame_path in tqdm(video_frames, desc="Processing frames"):
-            start_time = time.time()
-
             # Load and prepare the frame
             orig_image = read_image(frame_path).to(device)
             orig_image_float = orig_image.float()
@@ -53,15 +48,6 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
                 descriptors_batch, [frame_path], extractor, device=device
             )
             batched_visual_features = (similarity_maps[0] * 255.0).clamp(80, 255).squeeze()
-
-            # Resize batched result if needed
-            if batched_visual_features.shape[-2:] != orig_image.shape[-2:]:
-                batched_visual_features = torch.nn.functional.interpolate(
-                    batched_visual_features.unsqueeze(0).unsqueeze(0),
-                    size=orig_image.shape[-2:],
-                    mode='bilinear',
-                    align_corners=False
-                ).squeeze().squeeze()
 
             # Generate saliency map
             saliency_map = (batched_visual_features - batched_visual_features.min()) / \
@@ -82,8 +68,6 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
             # Convert image back to byte format
             noisy_image = noisy_image.clamp(0, 255).byte()
             processed_frames.append(noisy_image.permute(1, 2, 0).cpu().byte())
-
-            print(f"Processed frame {frame_path} in {(time.time() - start_time) * 1000:.2f} ms.")
     
     return processed_frames
 
@@ -98,7 +82,8 @@ def process_video(args):
     video_frames = [os.path.join(args.frames_dir, f) for f in os.listdir(args.frames_dir) if f.endswith(('.jpg', '.png'))]
     video_frames.sort(key=lambda x: int(os.path.splitext(os.path.basename(x))[0]))  # Sort frames numerically
 
-    video_frames = video_frames[:10]  # Process only the first 10 frames for demonstration
+    # video_frames = video_frames[:10]  # Process only the first 10 frames for demonstration
+
     if args.selected_descriptors is not None:
         # Process video frames
         processed_frames = process_video_frames(

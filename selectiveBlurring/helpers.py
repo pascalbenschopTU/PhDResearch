@@ -4,6 +4,7 @@ import numpy as np
 import PIL
 import torch
 from torchvision import transforms
+import torch.nn.functional as F
 from torchvision.utils import save_image
 from tqdm import tqdm
 from PIL import Image
@@ -208,7 +209,12 @@ def similarity_from_descriptors(
 
         similarity_image = combined_similarity.reshape(extractor.num_patches)
 
-        similarity_map_resized = transforms.Resize(img_size, antialias=True)(similarity_image.unsqueeze(0))
+        # similarity_map_resized = transforms.Resize(img_size, antialias=False)(similarity_image.unsqueeze(0))
+        similarity_map_resized = F.interpolate(
+            similarity_image.unsqueeze(0).unsqueeze(0),
+            size=img_size,
+            mode='nearest',  # `nearest` is faster than `bilinear`
+        ).squeeze()
 
         # Append the similarity map for this image
         similarities.append(similarity_map_resized.squeeze())
