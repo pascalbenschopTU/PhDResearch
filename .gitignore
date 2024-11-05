@@ -3,3 +3,7 @@ Action-Recognition/
 papers/
 SelectivePrivacyPreservation/
 TeD-SPAD/
+output/
+
+__pycache__/
+.DS_Store
