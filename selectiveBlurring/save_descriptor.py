@@ -69,47 +69,16 @@ def get_descriptor(
     os.makedirs(prefix_savepath, exist_ok=True)
 
     # Set up figure for interactive selection
-    fig, ax = plt.subplots()
-    fig.suptitle("Click to save descriptor (right click to exit)")
+    fig, ax = plt.subplots(figsize=(10, 6))
+    interactive_title = "Click to save descriptor (right click to exit)"
+    fig.suptitle(interactive_title)
     ax.imshow(image_pil_a)
     visible_patches = []
     radius = patch_size // 2
     descriptor_count = 1
 
-    # # Start the loop for interactive selection
-    # while True:
-    #     # Wait for a click and get coordinates
-    #     pts = np.asarray(
-    #         plt.ginput(1, timeout=-1, mouse_stop=plt.MouseButton.RIGHT, mouse_pop=None)
-    #     )
-    #     if len(pts) != 1:  # Exit loop if right-click
-    #         break
-
-    #     # Process coordinates
-    #     y_coor, x_coor = int(pts[0, 1]), int(pts[0, 0])
-    #     new_H = patch_size / stride * (load_size_a[0] // patch_size - 1) + 1
-    #     new_W = patch_size / stride * (load_size_a[1] // patch_size - 1) + 1
-    #     y_descs_coor = int(new_H / load_size_a[0] * y_coor)
-    #     x_descs_coor = int(new_W / load_size_a[1] * x_coor)
-    #     raveled_desc_idx = num_patches_a[1] * y_descs_coor + x_descs_coor
-
-    #     print(f"Selected patch at: ({x_descs_coor}, {y_descs_coor}), idx: {raveled_desc_idx}, descriptor shape: {descr.shape}")
-    #     point_descriptor = descr[0, 0, raveled_desc_idx]
-
-    #     # Draw a red dot on the selected point
-    #     center = (
-    #         (x_descs_coor - 1) * stride + stride + patch_size // 2 - 0.5,
-    #         (y_descs_coor - 1) * stride + stride + patch_size // 2 - 0.5,
-    #     )
-    #     patch = plt.Circle(center, radius, color=(1, 0, 0, 0.75))
-    #     ax.add_patch(patch)
-    #     fig.canvas.draw()
-
-    #     # Save the descriptor with a unique name
-    #     descriptor_filename = f"{descriptorname}_{descriptor_count}.pt"
-    #     torch.save(point_descriptor, os.path.join(prefix_savepath, descriptor_filename))
-    #     print(f"Saved descriptor to: {os.path.join(prefix_savepath, descriptor_filename)}")
-    #     descriptor_count += 1
+    # Define the path for the reference image
+    reference_image_path = os.path.join(prefix_savepath, f"{descriptorname}_reference.png")
 
     # Start the loop for interactive selection
     while True:
@@ -150,6 +119,16 @@ def get_descriptor(
         torch.save(point_descriptor, os.path.join(prefix_savepath, descriptor_filename))
         print(f"Saved descriptor to: {os.path.join(prefix_savepath, descriptor_filename)}")
         descriptor_count += 1
+
+        # Change the title for the saved image
+        fig.suptitle(f"Descriptors saved as '{descriptorname}' from selected points")
+        # Save the updated figure as a reference image after each point is added
+        fig.savefig(reference_image_path)
+        print(f"Updated reference image saved to: {reference_image_path}")
+        # Revert the title back to the interactive instruction
+        fig.suptitle(interactive_title)
+
+
 
 
 if __name__ == "__main__":
