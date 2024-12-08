@@ -9,6 +9,7 @@ PEL4VAD/
 extra/
 datasets/
 output/
+AnomalyCLIP/
 
 __pycache__/
 .DS_Store
