@@ -4,6 +4,11 @@ papers/
 SelectivePrivacyPreservation/
 TeD-SPAD/
 output/
+tc-clip/
+PEL4VAD/
+extra/
+datasets/
+output/
 
 __pycache__/
 .DS_Store

@@ -1,5 +1,6 @@
 import os
 import torch
+import cv2
 import torchvision.transforms as transforms
 from torchvision.transforms import GaussianBlur
 from tqdm import tqdm
@@ -77,7 +78,7 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     
     return processed_frames
 
-def process_video(args):
+def process_frames(args):
     """
     Processes video frames with privacy-preserving blur.
 
@@ -125,6 +126,81 @@ def process_video(args):
     )
     print(f"Processed frames saved to: {processed_gif_path}")
 
+def process_video(args):
+    """
+    Processes a video file with privacy-preserving blur and saves the anonymized video.
+
+    :param args: Command-line arguments.
+    """
+    # Define paths for input and output videos
+    video_path = args.video_path
+    output_dir = args.output_dir
+    os.makedirs(output_dir, exist_ok=True)
+
+    # Capture video
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        print(f"Error: Could not open video file {video_path}")
+        return
+    
+    # Get video properties
+    frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = int(cap.get(cv2.CAP_PROP_FPS))
+    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    
+    # Set up output video writer
+    output_video_path = os.path.join(output_dir, f"anonymized_{os.path.basename(video_path)}")
+    out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
+
+    # Process video in batches of frames
+    video_frames = []
+    batch_size = 32  # You can adjust batch size based on available GPU memory
+    frame_idx = 0
+
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break  # End of video
+
+        # Convert frame from BGR (OpenCV) to RGB (PyTorch format)
+        frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+        frame_pil = Image.fromarray(frame_rgb)
+
+        # Save frame as temporary file to feed into process_video_frames
+        temp_frame_path = os.path.join(output_dir, f"frame_{frame_idx:06d}.png")
+        frame_pil.save(temp_frame_path)
+        video_frames.append(temp_frame_path)
+        frame_idx += 1
+
+        # Process in batches
+        if len(video_frames) == batch_size or frame_idx == total_frames:
+            processed_frames = process_video_frames(
+                video_frames, 
+                args.descriptors_folder, 
+                args.selected_descriptors, 
+                model_type=args.model_type, 
+                device=args.device
+            )
+
+            # Write processed frames to output video
+            for processed_frame in processed_frames:
+                # Convert processed frame from tensor to numpy array
+                frame_np = processed_frame.numpy()
+                frame_bgr = cv2.cvtColor(frame_np, cv2.COLOR_RGB2BGR)
+                out.write(frame_bgr)
+
+            # Clear processed video frames from memory
+            for temp_path in video_frames:
+                os.remove(temp_path)  # Remove temporary frame file
+            video_frames = []  # Reset list for next batch
+
+    # Release video reader and writer
+    cap.release()
+    out.release()
+    print(f"Anonymized video saved to: {output_video_path}")
+
+
 def process_image(args):
     """
     Processes a single image with privacy-preserving blur.
@@ -166,6 +242,7 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Process video frames with privacy-preserving blur.")
     parser.add_argument("-f", "--frames_dir", type=str, required=False, help="Path to directory containing video frames.")
     parser.add_argument("-i", "--image_path", type=str, required=False, help="Path to image for descriptor extraction.")
+    parser.add_argument("-v", "--video_path", type=str, required=False, help="Path to video file for processing.")
     parser.add_argument("-df", "--descriptors_folder", type=str, required=True, help="Path to folder containing descriptor .pt files.")
     parser.add_argument("-ds", "--selected_descriptors", type=str, nargs='+', required=False, help="List of descriptor names to match and process.")
     parser.add_argument("-m", "--model_type", type=str, default="dino_vits8", help="Model type for descriptor extraction.")
@@ -179,6 +256,9 @@ if __name__ == "__main__":
         process_image(args)
     elif args.frames_dir is not None:
         # Process video frames
+        process_frames(args)
+    elif args.video_path is not None:
+        # Process video file
         process_video(args)
     else:
         print("Please provide either an image path or a directory containing video frames.")
