@@ -1,14 +1,15 @@
 import os
 import torch
 import cv2
-import torchvision.transforms as transforms
+import torch.nn.functional as F
 from torchvision.transforms import GaussianBlur
 from tqdm import tqdm
 from torchvision.io import read_image
 from PIL import Image
 import argparse
-from helpers import similarity_from_descriptors  # Import modified function
+from helpers import similarity_from_descriptors, flow_from_video, firstframe_warp
 from extractor import ViTExtractor
+from RAFT.core.raft import RAFT
 
 def process_video_frames(video_frames, descriptors_folder, selected_descriptors, model_type="dino_vits8", stride=4, device="cuda"):
     """
@@ -24,6 +25,12 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     """
     device = torch.device(device)
     extractor = ViTExtractor(model_type, stride=stride, device=device)
+
+    flow_model = torch.nn.DataParallel(RAFT(args))
+    flow_model.load_state_dict(torch.load("RAFT/models/raft-sintel.pth", map_location=torch.device('cpu')))
+    flow_model = flow_model.module
+    flow_model.to(device)
+    flow_model.eval()
 
     # Generate an instance of the GaussianBlur class
     blur_kernel_size = 49  # Kernel size for blurring
@@ -44,6 +51,13 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     with torch.no_grad():
         for i in tqdm(range(0, len(video_frames), batch_size), desc="Processing frames"):
             batch_frames = video_frames[i:i + batch_size]
+
+            print(len(batch_frames))
+            if len(batch_frames) < batch_size:
+                # Pad the batch to match the batch size
+                batch_frames += [batch_frames[-1]] * (batch_size - len(batch_frames))
+
+            
             
             # Load and prepare the frames
             orig_images = [read_image(frame_path).to(device) for frame_path in batch_frames]
@@ -54,6 +68,20 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
                 descriptors_batch, batch_frames, extractor, device=device
             )
 
+            similarity_maps = F.interpolate(
+                similarity_maps,
+                size=(orig_images_float[0].shape[1], orig_images_float[0].shape[2]),
+                mode="bilinear",
+            ).squeeze(1)
+
+            # Create temporally consistent noise
+            flow = flow_from_video(flow_model, orig_images_float, upsample_factor=args.upsample)
+            afd = firstframe_warp(
+                flow,
+                usecolor=True,
+            )
+            print(len(flow))
+
             for j, frame_path in enumerate(batch_frames):
                 batched_visual_features = (similarity_maps[j] * 255.0).clamp(80, 255).squeeze()
 
@@ -62,15 +90,17 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
                                (batched_visual_features.max() - batched_visual_features.min())
                 
                 # Generate a blurred version of the image
-                blurred_image = gauss_blur(orig_images_float[j])
+                # blurred_image = gauss_blur(orig_images_float[j])
+                blurred_image = afd[j].permute(2, 0, 1).to(device)
 
                 # Adjust saliency map for blending
                 saliency_map_adjusted = torch.where(saliency_map > 0.1, 0.75 + saliency_map, torch.zeros_like(saliency_map))
                 saliency_map_adjusted = torch.clamp(saliency_map_adjusted, 0.0, 1.0)
                 saliency_map_adjusted = saliency_map_adjusted.to(device)
+                saliency_map_adjusted = saliency_map_adjusted.unsqueeze(0)
 
                 # Blend original and blurred images using adjusted saliency map
-                noisy_image = orig_images_float[j] * (1 - saliency_map_adjusted.unsqueeze(0)) + blurred_image * saliency_map_adjusted.unsqueeze(0)
+                noisy_image = orig_images_float[j] * (1 - saliency_map_adjusted) + blurred_image * saliency_map_adjusted
 
                 # Convert image back to byte format
                 noisy_image = noisy_image.clamp(0, 255).byte()
@@ -250,6 +280,11 @@ if __name__ == "__main__":
     parser.add_argument("-o", "--output_dir", type=str, default="output", help="Output directory for processed frames.")
     
     args = parser.parse_args()
+
+    args.alternate_corr = False
+    args.mixed_precision = True
+    args.small = False
+    args.upsample = 1
 
     if args.image_path is not None:
         # Process a single image

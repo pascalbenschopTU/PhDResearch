@@ -4,10 +4,15 @@ import numpy as np
 import PIL
 import torch
 from torchvision import transforms
+from scipy import interpolate
 import torch.nn.functional as F
+import torch.nn as nn
 from torchvision.utils import save_image
+from torchvision.io import ImageReadMode, read_image
+from torchvision.transforms import Resize
+from torchvision.transforms.functional import InterpolationMode
 from tqdm import tqdm
-from PIL import Image
+
 
 from extractor import ViTExtractor
 
@@ -199,12 +204,189 @@ def similarity_from_descriptors(
     # Reshape for batch-wise resizing
     combined_similarity = combined_similarity.reshape(-1, 1, *extractor.num_patches)  # Shape: (batch_size, 1, num_patches_height, num_patches_width)
 
-    # Resize all similarity maps in one operation to match each original image size
-    resized_similarity_maps = F.interpolate(
-        combined_similarity,  # Shape: (batch_size, 1, sqrt(num_patches), sqrt(num_patches))
-        size=original_size,  # Each image's original size
-        mode="bilinear",  # Bilinear interpolation for resizing
-    ).squeeze(1)  # Remove channel dimension, final shape: (batch_size, height, width)
+    # # Resize all similarity maps in one operation to match each original image size
+    # resized_similarity_maps = F.interpolate(
+    #     combined_similarity,  # Shape: (batch_size, 1, sqrt(num_patches), sqrt(num_patches))
+    #     size=original_size,  # Each image's original size
+    #     mode="bilinear",  # Bilinear interpolation for resizing
+    # ).squeeze(1)  # Remove channel dimension, final shape: (batch_size, height, width)
 
-    return resized_similarity_maps
+    # return resized_similarity_maps
 
+    return combined_similarity
+
+def batch_warp(img, flow, mode="bilinear", padding_mode="zeros"):
+    # img.shape -> B, 3, H, W
+    # flow.shape -> B, H, W, 2
+    (
+        b,
+        c,
+        h,
+        w,
+    ) = img.shape
+    y_coords = torch.linspace(-1, 1, h)
+    x_coords = torch.linspace(-1, 1, w)
+    f0 = (
+        torch.stack(torch.meshgrid(x_coords, y_coords))
+        .permute(2, 1, 0)
+        .repeat(b, 1, 1, 1)
+    )
+
+    f = f0 + torch.stack([2 * (flow[..., 0] / w), 2 * (flow[..., 1] / h)], dim=3)
+    warped = F.grid_sample(img, f, mode=mode, padding_mode=padding_mode)
+    return warped.squeeze()
+
+def firstframe_warp(
+    flows, interpolation_mode="nearest", usecolor=True, seed_image=None
+):
+    if len(flows) == 0:
+        return None
+    
+    h, w, _ = flows[0].shape
+    c = 3 if usecolor == True else 1
+
+    t = len(flows)
+    flows = torch.stack(flows)
+
+    if usecolor:
+        inits = (torch.rand((1, c, h, w))).repeat(t, 1, 1, 1)
+    else:
+        inits = (torch.rand((1, 1, h, w))).repeat(t, 3, 1, 1)
+
+    if seed_image != None:
+        inits = read_image(seed_image, ImageReadMode.RGB) / 255.0
+        inits = Resize((h, w), interpolation=InterpolationMode.NEAREST)(inits)
+        inits = inits.repeat(t, 1, 1, 1)
+
+    warped = batch_warp(inits, flows, mode=interpolation_mode)
+    masks = ~(warped.any(dim=1))
+    masks = masks.unsqueeze(1).repeat(1, 3, 1, 1)
+    warped[masks] = inits[masks]
+    warped = torch.cat([inits[0, ...].unsqueeze(dim=0), warped], dim=0)
+    warped = (warped).clip(0, 1)
+    # warped = Resize(size=(int(h * 0.5), int(w * 0.5)))(warped)
+    # warped = warped[:, :, 10:-10, 10:-10]
+    warped = (warped.permute(0, 2, 3, 1) * 255).float()
+    return warped
+
+def upsample_flow(flow, h, w):
+    # usefull function to bring the flow to h,w shape
+    # so that we can warp effectively an image of that size with it
+    h_new, w_new, _ = flow.shape
+    flow_correction = torch.Tensor((h / h_new, w / w_new))
+    f = flow * flow_correction[None, None, :]
+
+    f = (
+        Resize((h, w), interpolation=InterpolationMode.BICUBIC)(f.permute(2, 0, 1))
+    ).permute(1, 2, 0)
+    return f
+
+def flow_from_video(model, frames_list, upsample_factor=1):
+    num_frames = len(frames_list)
+    all_flows = []
+    c, h, w = frames_list[0].shape
+    with torch.no_grad():
+        for i in range(num_frames - 1):
+            if torch.cuda.is_available():
+                image0 = frames_list[i].unsqueeze(0).cuda()
+                image1 = frames_list[i + 1].unsqueeze(0).cuda()
+            else:
+                image0 = frames_list[i].unsqueeze(0)
+                image1 = frames_list[i + 1].unsqueeze(0)
+
+            if upsample_factor != 1:
+                image0 = nn.Upsample(scale_factor=upsample_factor, mode="bilinear")(
+                    image0
+                )
+                image1 = nn.Upsample(scale_factor=upsample_factor, mode="bilinear")(
+                    image1
+                )
+
+            padder = InputPadder(image0.shape)
+            image0, image1 = padder.pad(image0, image1)
+            _, flow_up = model(image0, image1, iters=12, test_mode=True)
+            flow_output = (
+                padder.unpad(flow_up).detach().cpu().squeeze().permute(1, 2, 0)
+            )
+            fl = flow_output.detach().cpu().squeeze()
+            fl = upsample_flow(fl, h, w)
+            all_flows.append(fl)
+    return all_flows
+
+
+class InputPadder:
+    """ Pads images such that dimensions are divisible by 8 """
+    def __init__(self, dims, mode='sintel'):
+        self.ht, self.wd = dims[-2:]
+        pad_ht = (((self.ht // 8) + 1) * 8 - self.ht) % 8
+        pad_wd = (((self.wd // 8) + 1) * 8 - self.wd) % 8
+        if mode == 'sintel':
+            self._pad = [pad_wd//2, pad_wd - pad_wd//2, pad_ht//2, pad_ht - pad_ht//2]
+        else:
+            self._pad = [pad_wd//2, pad_wd - pad_wd//2, 0, pad_ht]
+
+    def pad(self, *inputs):
+        return [F.pad(x, self._pad, mode='replicate') for x in inputs]
+
+    def unpad(self,x):
+        ht, wd = x.shape[-2:]
+        c = [self._pad[2], ht-self._pad[3], self._pad[0], wd-self._pad[1]]
+        return x[..., c[0]:c[1], c[2]:c[3]]
+
+def forward_interpolate(flow):
+    flow = flow.detach().cpu().numpy()
+    dx, dy = flow[0], flow[1]
+
+    ht, wd = dx.shape
+    x0, y0 = np.meshgrid(np.arange(wd), np.arange(ht))
+
+    x1 = x0 + dx
+    y1 = y0 + dy
+    
+    x1 = x1.reshape(-1)
+    y1 = y1.reshape(-1)
+    dx = dx.reshape(-1)
+    dy = dy.reshape(-1)
+
+    valid = (x1 > 0) & (x1 < wd) & (y1 > 0) & (y1 < ht)
+    x1 = x1[valid]
+    y1 = y1[valid]
+    dx = dx[valid]
+    dy = dy[valid]
+
+    flow_x = interpolate.griddata(
+        (x1, y1), dx, (x0, y0), method='nearest', fill_value=0)
+
+    flow_y = interpolate.griddata(
+        (x1, y1), dy, (x0, y0), method='nearest', fill_value=0)
+
+    flow = np.stack([flow_x, flow_y], axis=0)
+    return torch.from_numpy(flow).float()
+
+
+def bilinear_sampler(img, coords, mode='bilinear', mask=False):
+    """ Wrapper for grid_sample, uses pixel coordinates """
+    H, W = img.shape[-2:]
+    xgrid, ygrid = coords.split([1,1], dim=-1)
+    xgrid = 2*xgrid/(W-1) - 1
+    ygrid = 2*ygrid/(H-1) - 1
+
+    grid = torch.cat([xgrid, ygrid], dim=-1)
+    img = F.grid_sample(img, grid, align_corners=True)
+
+    if mask:
+        mask = (xgrid > -1) & (ygrid > -1) & (xgrid < 1) & (ygrid < 1)
+        return img, mask.float()
+
+    return img
+
+
+def coords_grid(batch, ht, wd):
+    coords = torch.meshgrid(torch.arange(ht), torch.arange(wd))
+    coords = torch.stack(coords[::-1], dim=0).float()
+    return coords[None].repeat(batch, 1, 1, 1)
+
+
+def upflow8(flow, mode='bilinear'):
+    new_size = (8 * flow.shape[2], 8 * flow.shape[3])
+    return  8 * F.interpolate(flow, size=new_size, mode=mode, align_corners=True)
