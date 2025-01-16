@@ -12,6 +12,7 @@ from torchvision.io import ImageReadMode, read_image
 from torchvision.transforms import Resize
 from torchvision.transforms.functional import InterpolationMode
 from tqdm import tqdm
+import cv2
 
 
 from extractor import ViTExtractor
@@ -161,7 +162,7 @@ def batch_chunk_cosine_sim(x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
 
 def similarity_from_descriptors(
     descriptors_batch,  # Shape: (num_descriptors, descriptor_dim)
-    image_paths: list,
+    images: torch.Tensor,  # Shape: (batch_size, C, H, W)
     extractor: ViTExtractor,
     load_size: int = 224,
     layer: int = 11,
@@ -182,7 +183,10 @@ def similarity_from_descriptors(
     :return: Tensor of resized similarity maps, shape (batch_size, height, width).
     """
     # Preprocess images in a batch and get original sizes
-    image_batch, original_size = extractor.preprocess_batch(image_paths, load_size)  # Shape: (batch_size, C, H, W)
+    if len(images.shape) == 3:
+        images = images.unsqueeze(0)
+    
+    image_batch, original_size = extractor.preprocess_batch_from_tensor(images, load_size=(load_size, load_size))  # Shape: (batch_size, C, H, W)
     image_batch = image_batch.to(device)
     descriptors_batch = descriptors_batch.to(device)  # Move descriptors to device
 
@@ -204,18 +208,9 @@ def similarity_from_descriptors(
     # Reshape for batch-wise resizing
     combined_similarity = combined_similarity.reshape(-1, 1, *extractor.num_patches)  # Shape: (batch_size, 1, num_patches_height, num_patches_width)
 
-    # # Resize all similarity maps in one operation to match each original image size
-    # resized_similarity_maps = F.interpolate(
-    #     combined_similarity,  # Shape: (batch_size, 1, sqrt(num_patches), sqrt(num_patches))
-    #     size=original_size,  # Each image's original size
-    #     mode="bilinear",  # Bilinear interpolation for resizing
-    # ).squeeze(1)  # Remove channel dimension, final shape: (batch_size, height, width)
-
-    # return resized_similarity_maps
-
     return combined_similarity
 
-def batch_warp(img, flow, mode="bilinear", padding_mode="zeros"):
+def batch_warp(img, flow, mode="bilinear", padding_mode="zeros", device="cuda"):
     # img.shape -> B, 3, H, W
     # flow.shape -> B, H, W, 2
     (
@@ -230,14 +225,14 @@ def batch_warp(img, flow, mode="bilinear", padding_mode="zeros"):
         torch.stack(torch.meshgrid(x_coords, y_coords))
         .permute(2, 1, 0)
         .repeat(b, 1, 1, 1)
-    )
+    ).to(device)
 
     f = f0 + torch.stack([2 * (flow[..., 0] / w), 2 * (flow[..., 1] / h)], dim=3)
     warped = F.grid_sample(img, f, mode=mode, padding_mode=padding_mode)
     return warped.squeeze()
 
 def firstframe_warp(
-    flows, interpolation_mode="nearest", usecolor=True, seed_image=None
+    flows, interpolation_mode="nearest", usecolor=True, seed_image=None, device="cuda"
 ):
     if len(flows) == 0:
         return None
@@ -246,15 +241,19 @@ def firstframe_warp(
     c = 3 if usecolor == True else 1
 
     t = len(flows)
-    flows = torch.stack(flows)
+    # flows = torch.stack(flows)
 
     if usecolor:
-        inits = (torch.rand((1, c, h, w))).repeat(t, 1, 1, 1)
+        inits = (torch.rand((1, c, h, w))).repeat(t, 1, 1, 1).to(device)
     else:
-        inits = (torch.rand((1, 1, h, w))).repeat(t, 3, 1, 1)
+        inits = (torch.rand((1, 1, h, w))).repeat(t, 3, 1, 1).to(device)
 
     if seed_image != None:
-        inits = read_image(seed_image, ImageReadMode.RGB) / 255.0
+        if isinstance(seed_image, str):
+            inits = read_image(seed_image, ImageReadMode.RGB) / 255.0
+        else:
+            inits = seed_image
+        
         inits = Resize((h, w), interpolation=InterpolationMode.NEAREST)(inits)
         inits = inits.repeat(t, 1, 1, 1)
 
@@ -281,37 +280,67 @@ def upsample_flow(flow, h, w):
     ).permute(1, 2, 0)
     return f
 
-def flow_from_video(model, frames_list, upsample_factor=1):
+def flow_from_video(model, frames_list, upsample_factor=1, device="cpu", iters=12):
     num_frames = len(frames_list)
-    all_flows = []
-    c, h, w = frames_list[0].shape
-    with torch.no_grad():
-        for i in range(num_frames - 1):
-            if torch.cuda.is_available():
-                image0 = frames_list[i].unsqueeze(0).cuda()
-                image1 = frames_list[i + 1].unsqueeze(0).cuda()
-            else:
-                image0 = frames_list[i].unsqueeze(0)
-                image1 = frames_list[i + 1].unsqueeze(0)
+    h, w = frames_list[0].shape[1:3]  # Height and width of frames
 
-            if upsample_factor != 1:
-                image0 = nn.Upsample(scale_factor=upsample_factor, mode="bilinear")(
-                    image0
-                )
-                image1 = nn.Upsample(scale_factor=upsample_factor, mode="bilinear")(
-                    image1
-                )
+    # Prepare frames as a batch
+    # frames_tensor = torch.stack(frames_list).to(device)
+    frames_tensor = frames_list.to(device)
 
-            padder = InputPadder(image0.shape)
-            image0, image1 = padder.pad(image0, image1)
-            _, flow_up = model(image0, image1, iters=12, test_mode=True)
-            flow_output = (
-                padder.unpad(flow_up).detach().cpu().squeeze().permute(1, 2, 0)
-            )
-            fl = flow_output.detach().cpu().squeeze()
-            fl = upsample_flow(fl, h, w)
-            all_flows.append(fl)
-    return all_flows
+    # Optionally upsample frames once
+    if upsample_factor != 1:
+        frames_tensor = F.interpolate(frames_tensor, scale_factor=upsample_factor, mode="bilinear")
+
+    # Create batched frame pairs
+    image0 = frames_tensor[:-1]  # All except the last frame
+    image1 = frames_tensor[1:]   # All except the first frame
+
+    # Pad all pairs together
+    padder = InputPadder(image0.shape)
+    image0, image1 = padder.pad(image0, image1)
+
+    # Process all pairs in one batch
+    # with torch.no_grad():
+    _, flow_up = model(image0, image1, iters=iters, test_mode=True)
+
+    # Remove padding and reshape flows
+    flow_output = padder.unpad(flow_up)
+
+    # Optionally resize flows to the original resolution
+    if upsample_factor != 1:
+        flow_output = F.interpolate(flow_output, size=(h, w), mode="bilinear")
+
+    return flow_output.permute(0, 2, 3, 1)  # Convert to (H, W, 2)
+
+
+# def flow_from_video(model, frames_list, upsample_factor=1, device="cuda", iters=12):
+#     num_frames = len(frames_list)
+#     all_flows = []
+#     c, h, w = frames_list[0].shape
+#     with torch.no_grad():
+#         for i in range(num_frames - 1):
+#             image0 = frames_list[i].unsqueeze(0).to(device)
+#             image1 = frames_list[i + 1].unsqueeze(0).to(device)
+
+#             if upsample_factor != 1:
+#                 image0 = nn.Upsample(scale_factor=upsample_factor, mode="bilinear")(
+#                     image0
+#                 )
+#                 image1 = nn.Upsample(scale_factor=upsample_factor, mode="bilinear")(
+#                     image1
+#                 )
+
+#             padder = InputPadder(image0.shape)
+#             image0, image1 = padder.pad(image0, image1)
+#             _, flow_up = model(image0, image1, iters=iters, test_mode=True)
+#             flow_output = (
+#                 padder.unpad(flow_up).detach().cpu().squeeze().permute(1, 2, 0)
+#             )
+#             fl = flow_output.detach().cpu().squeeze()
+#             fl = upsample_flow(fl, h, w)
+#             all_flows.append(fl)
+#     return all_flows
 
 
 class InputPadder:

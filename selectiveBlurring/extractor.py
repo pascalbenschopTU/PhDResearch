@@ -74,7 +74,7 @@ class ViTExtractor:
         """
         if "dino" in model_type:
             model = torch.hub.load(
-                "facebookresearch/dino:main", model_type, verbose=False
+                "facebookresearch/dino:main", model_type, verbose=True
             )
         else:  # model from timm -- load weights from timm to dino model (enables working on arbitrary size images).
             temp_model = timm.create_model(model_type, pretrained=True)
@@ -189,43 +189,34 @@ class ViTExtractor:
         prep_img = prep(pil_image)[None, ...]
         return prep_img, pil_image
     
-    def preprocess_batch(
+    def preprocess_batch_from_tensor(
         self, 
-        image_paths: List[Union[str, Path]], 
+        images_tensor: torch.Tensor, 
         load_size: Union[int, Tuple[int, int]] = None
     ) -> Tuple[torch.Tensor, Tuple[int, int]]:
         """
-        Preprocesses a batch of images before extraction.
+        Preprocesses a batch of images from a tensor before extraction.
         
-        :param image_paths: list of paths to images to be extracted.
+        :param images_tensor: tensor of images to be preprocessed. Shape should be BxCxHxW.
         :param load_size: optional. Size to resize images before further processing.
         
         :return: a tuple containing:
                     (1) the preprocessed images as a tensor of shape BxCxHxW.
                     (2) the original (height, width) dimensions of the first image.
         """
-        images = []
-        original_size = None
+        B, C, H, W = images_tensor.shape
+        original_size = (H, W)
         
-        for image_path in image_paths:
-            pil_image = Image.open(image_path).convert("RGB")
-            if original_size is None:
-                original_size = pil_image.size[::-1]  # Store original (height, width) of the first image
-            
-            if load_size is not None:
-                pil_image = transforms.Resize(
-                    load_size, interpolation=transforms.InterpolationMode.LANCZOS
-                )(pil_image)
-            
-            # Convert to tensor and normalize
-            prep = transforms.Compose(
-                [transforms.ToTensor(), transforms.Normalize(mean=self.mean, std=self.std)]
+        if load_size is not None and (H, W) != load_size:
+            resize_transform = transforms.Resize(
+                load_size, interpolation=transforms.InterpolationMode.LANCZOS
             )
-            prep_img = prep(pil_image)
-            images.append(prep_img)
+            images_tensor = torch.stack([transforms.ToTensor()(resize_transform(transforms.ToPILImage()(img))) for img in images_tensor])
         
-        # Stack all images to form a batch
-        images_tensor = torch.stack(images)  # Shape: (batch_size, C, H, W)
+        # Normalize
+        normalize_transform = transforms.Normalize(mean=self.mean, std=self.std)
+        images_tensor = images_tensor.float() / 255.0
+        images_tensor = torch.stack([normalize_transform(img) for img in images_tensor])
         
         return images_tensor, original_size
 
