@@ -22,7 +22,7 @@ python save_descriptor.py -i <image_path> -n <name>
 For images, you can provide one or more descriptor names, e.g. for the descriptors face_1, face_2 etc you can use `-ds face`, which you can combine with other descriptor names.
 For device, use `cuda` with nvidia and `mps` with macbook m1+.
 ```
-python video_blur.py -f <video_path> -df output/descriptors/ -ds <descriptor 1> <descriptor 2> ... -dev <device>
+python video_blur.py -f <frame_directory_path> -df output/descriptors/ -ds <descriptor 1> <descriptor 2> ... -dev <device>
 ```
 
 ```

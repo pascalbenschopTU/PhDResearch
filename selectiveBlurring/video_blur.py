@@ -31,7 +31,7 @@ def process_frame_batch(orig_images_float, descriptors_batch, extractor, flow_mo
     # Resize frames to 224x224 for descriptor matching
     images_224 = F.interpolate(orig_images_float, size=(224, 224), mode="bilinear")
 
-    # Compute similarity map using descriptors
+    # Compute similarity map using loaded descriptors
     similarity_maps = similarity_from_descriptors(
         descriptors_batch, images_224, extractor, device=device
     )
@@ -41,6 +41,7 @@ def process_frame_batch(orig_images_float, descriptors_batch, extractor, flow_mo
         similarity_maps, size=(original_height, original_width), mode="bilinear"
     ).squeeze(1)
 
+    # Flow can be used in video to create motion consistent noise
     if flow_model:
         # Generate optical flow for temporal consistency
         flow = flow_from_video(flow_model, images_224, upsample_factor=1.0, device=device, iters=12)
@@ -50,15 +51,16 @@ def process_frame_batch(orig_images_float, descriptors_batch, extractor, flow_mo
         blurred_images = afd.permute(0, 3, 1, 2).to(device)
         blurred_images = F.interpolate(blurred_images, size=(original_height, original_width))
     else:
-        blurred_images = GaussianBlur(kernel_size=(15, 15), sigma=(5, 5))(orig_images_float)
+        blurred_images = GaussianBlur(kernel_size=(69, 69), sigma=(10, 10))(orig_images_float)
 
     # Scale and normalize similarity maps
-    batched_visual_features = (similarity_maps * 255.0).clamp(90, 255).unsqueeze(1)
+    batched_visual_features = (similarity_maps * 255.0).clamp(80, 255).unsqueeze(1)
     batched_visual_features = F.interpolate(batched_visual_features, size=(original_height, original_width))
     min_vals = torch.amin(batched_visual_features, dim=(1, 2), keepdim=True)
     max_vals = torch.amax(batched_visual_features, dim=(1, 2), keepdim=True)
-    saliency_maps = (batched_visual_features - min_vals) / (max_vals - min_vals + 1e-8)
 
+    # The saliency maps are used as soft mask (can be converted to hard mask by thresholding)
+    saliency_maps = (batched_visual_features - min_vals) / (max_vals - min_vals + 1e-8)
 
     # Blend original and blurred images
     noisy_images = orig_images_float * (1 - saliency_maps) + blurred_images * saliency_maps
