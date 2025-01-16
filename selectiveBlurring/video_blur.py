@@ -13,7 +13,7 @@ from extractor import ViTExtractor
 from RAFT.core.raft import RAFT
 
 
-def process_frame_batch(orig_images_float, descriptors_batch, extractor, flow_model, device, seed_image=None):
+def process_frame_batch(orig_images_float, descriptors_batch, extractor, flow_model=None, device="cuda", seed_image=None):
     """
     Process a batch of video frames by applying saliency-based adaptive blurring.
 
@@ -41,38 +41,48 @@ def process_frame_batch(orig_images_float, descriptors_batch, extractor, flow_mo
         similarity_maps, size=(original_height, original_width), mode="bilinear"
     ).squeeze(1)
 
-    # Generate optical flow for temporal consistency
-    flow = flow_from_video(flow_model, images_224, upsample_factor=1.0, device=device, iters=12)
-    afd = firstframe_warp(flow, usecolor=True, seed_image=seed_image)
+    if flow_model:
+        # Generate optical flow for temporal consistency
+        flow = flow_from_video(flow_model, images_224, upsample_factor=1.0, device=device, iters=12)
+        afd = firstframe_warp(flow, usecolor=True, seed_image=seed_image, device=device)
+
+        # Blur the frames using afd
+        blurred_images = afd.permute(0, 3, 1, 2).to(device)
+        blurred_images = F.interpolate(blurred_images, size=(original_height, original_width))
+    else:
+        blurred_images = GaussianBlur(kernel_size=(15, 15), sigma=(5, 5))(orig_images_float)
 
     # Scale and normalize similarity maps
     batched_visual_features = (similarity_maps * 255.0).clamp(90, 255).unsqueeze(1)
     batched_visual_features = F.interpolate(batched_visual_features, size=(original_height, original_width))
-
     min_vals = torch.amin(batched_visual_features, dim=(1, 2), keepdim=True)
     max_vals = torch.amax(batched_visual_features, dim=(1, 2), keepdim=True)
     saliency_maps = (batched_visual_features - min_vals) / (max_vals - min_vals + 1e-8)
 
-    # Blur the frames using afd
-    blurred_images = afd.permute(0, 3, 1, 2).to(device)
-    blurred_images = F.interpolate(blurred_images, size=(original_height, original_width))
 
     # Blend original and blurred images
     noisy_images = orig_images_float * (1 - saliency_maps) + blurred_images * saliency_maps
     noisy_images = noisy_images.clamp(0, 255).permute(0, 2, 3, 1).cpu().byte()
 
+    # Seed image is used to warp the consecutive frames in a batch
     if seed_image is not None:
-        # print(f"AFD shape: {afd.shape}, seed_image shape: {seed_image.shape}, vallues afd: {afd.min().item()}, {afd.max().item()}")
         new_seed_image = afd[-1].permute(2, 0, 1).unsqueeze(0)
-        print(f"New seed image shape: {new_seed_image.shape}, values: {new_seed_image.min().item()}, {new_seed_image.max().item()}")
         # Normalize
         new_seed_image = (new_seed_image - new_seed_image.min()) / (new_seed_image.max() - new_seed_image.min())
         return noisy_images, new_seed_image
     else:
-        return noisy_images
+        return noisy_images, None
 
 
-def process_video_frames(video_frames, descriptors_folder, selected_descriptors, model_type="dino_vits8", stride=4, device="cuda"):
+def process_video_frames(
+        video_frames, 
+        descriptors_folder, 
+        selected_descriptors, 
+        model_type="dino_vits8", 
+        stride=4, 
+        device="cuda",
+        use_flow=False
+    ):
     """
     Processes each frame of a video, applying saliency-based adaptive blurring.
 
@@ -90,12 +100,18 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
 
     print(f"Number of parameters in {model_type} model: {sum(p.numel() for p in extractor.model.parameters())}")
 
-    flow_model = torch.nn.DataParallel(RAFT(args))
-    print(f"Number of parameters in RAFT model: {sum(p.numel() for p in flow_model.parameters())}")
-    flow_model.load_state_dict(torch.load("RAFT/models/raft-sintel.pth", map_location=device))
-    flow_model = flow_model.module
-    flow_model.to(device)
-    flow_model.eval()
+    if use_flow:
+        # Load pre-trained RAFT model
+        flow_model = torch.nn.DataParallel(RAFT(args))
+        print(f"Number of parameters in RAFT model: {sum(p.numel() for p in flow_model.parameters())}")
+        flow_model.load_state_dict(torch.load("RAFT/models/raft-sintel.pth", map_location=device))
+        flow_model = flow_model.module
+        flow_model.to(device)
+        flow_model.eval()
+        seed_image = torch.randn(1, 3, 224, 224).to(device)
+    else:
+        flow_model = None
+        seed_image = None
 
     # Load descriptors
     descriptor_files = [f for f in os.listdir(descriptors_folder) if f.endswith(".pt")]
@@ -108,7 +124,6 @@ def process_video_frames(video_frames, descriptors_folder, selected_descriptors,
     processed_frames = []
     batch_size = 8
 
-    seed_image = torch.randn(1, 3, 224, 224).to(device)
     with torch.no_grad():
         for i in tqdm(range(0, len(video_frames), batch_size), desc="Processing frames"):
             batch_frames = video_frames[i:i + batch_size]
@@ -147,7 +162,8 @@ def process_frames(args):
             args.descriptors_folder, 
             args.selected_descriptors, 
             model_type=args.model_type, 
-            device=args.device
+            device=args.device,
+            use_flow=args.use_flow,
         )
         print(f"Processed {len(processed_frames)} frames.")
     else:
@@ -238,11 +254,12 @@ def process_video(args):
         args.descriptors_folder, 
         args.selected_descriptors, 
         model_type=args.model_type, 
-        device=args.device
+        device=args.device,
+        use_flow=args.use_flow,
     )
 
-    # Set up output video writer
-    output_video_path = os.path.join(output_dir, f"anonymized_{os.path.basename(video_path)}")
+    # Set up output video writer, and create .mp4 video file
+    output_video_path = os.path.join(output_dir, f"anonymized_{os.path.splitext(os.path.basename(video_path))[0]}.mp4")
     out = cv2.VideoWriter(output_video_path, cv2.VideoWriter_fourcc(*'mp4v'), fps, (frame_width, frame_height))
 
     # Write processed frames to output video
@@ -285,7 +302,8 @@ def process_image(args):
         args.descriptors_folder, 
         args.selected_descriptors, 
         model_type=args.model_type, 
-        device=args.device
+        device=args.device,
+        use_flow=args.use_flow,
     )[0]
 
     # Save the processed image
@@ -307,6 +325,7 @@ if __name__ == "__main__":
     parser.add_argument("-m", "--model_type", type=str, default="dino_vits8", help="Model type for descriptor extraction.")
     parser.add_argument("-dev", "--device", type=str, default="cuda", help="Device to perform computations on (e.g., 'cuda', 'mps', or 'cpu').")
     parser.add_argument("-o", "--output_dir", type=str, default="output", help="Output directory for processed frames.")
+    parser.add_argument("-flow", "--use_flow", action="store_true", help="Use optical flow for temporal consistency.")
     
     args = parser.parse_args()
 

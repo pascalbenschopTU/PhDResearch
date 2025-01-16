@@ -257,7 +257,7 @@ def firstframe_warp(
         inits = Resize((h, w), interpolation=InterpolationMode.NEAREST)(inits)
         inits = inits.repeat(t, 1, 1, 1)
 
-    warped = batch_warp(inits, flows, mode=interpolation_mode)
+    warped = batch_warp(inits, flows, mode=interpolation_mode, device=device)
     masks = ~(warped.any(dim=1))
     masks = masks.unsqueeze(1).repeat(1, 3, 1, 1)
     warped[masks] = inits[masks]
